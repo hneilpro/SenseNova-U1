@@ -48,6 +48,33 @@ Second proven default, also hardcoded in `nova_api.py`:
 edit inputs downscale to `input_max_pixels = 1048576`, matching the CLI
 run scripts.
 
+## Ollama eviction — Nova claims the GPU per generation
+
+SillyTavern's Ollama model (Cydonia-24B, ~16.9GB VRAM) is pinned resident
+by ST's `config.yaml` (`ollama.keepAlive: -1`). Before every generation,
+`ollama_evict.py` (called from `nova_api.py`, inside the generation lock):
+
+1. Checks Ollama `/api/ps` — nothing loaded means nothing to do.
+2. Busy-waits if llama-server is actively generating (CPU sampled over
+   4s windows; 60s cap). An in-flight ST reply is never evicted
+   mid-generation; if ST is still busy at the cap, Nova generates
+   WITHOUT evicting rather than kill a reply.
+3. Sends `keep_alive: 0` and polls `/api/ps` until VRAM is confirmed
+   free (30s cap), then the generation runs with the full 24GB card.
+
+Ollama reloads its model automatically on the next ST message (one slow
+first reply per switch) — nothing to restore. All steps log with an
+`[evict]` prefix in `~/nova-api.log`, and the hook is fail-open: any
+error still lets the generation proceed.
+
+Transport note: Nova runs in WSL, Ollama is Windows-native, and WSL
+localhost can't reach it — the hook talks to Ollama through the Windows
+`curl.exe` / `powershell.exe` binaries via interop.
+
+Controls: disable globally with env `NOVA_EVICT_OLLAMA=0`, or per
+request with `"evict_ollama": false` in the generation/edit body.
+`/health` reports whether the hook is active as `ollama_evict`.
+
 ## Run
 
 ```bash

@@ -15,6 +15,13 @@ Design:
 - Binds 127.0.0.1 only. Remote access is via the cloudflared named tunnel
   (nova.hneil.net). Every endpoint requires the bearer token.
 - One generation at a time (GPU is serial); concurrent callers get 429.
+- Before each generation, the Ollama eviction hook (ollama_evict.py)
+  claims the GPU: if SillyTavern's Ollama model is resident (~16.9GB
+  VRAM, pinned by keepAlive -1) and NOT actively generating, it is
+  unloaded so Nova generates with the full card; Ollama reloads it
+  automatically on the next ST message. An in-flight ST reply is waited
+  out (60s cap), never evicted mid-generation. Disable globally with
+  NOVA_EVICT_OLLAMA=0, or per request with {"evict_ollama": false}.
 
 Endpoints:
   GET  /health                  -> {status, model, vram_mode, busy}
@@ -75,6 +82,17 @@ STATE = {
     "busy": False,
 }
 GEN_LOCK = threading.Lock()
+
+# Ollama eviction hook (see ollama_evict.py). Import is optional so a
+# missing/broken hook module can never take the API down; the hook itself
+# is fail-open as well. NOVA_EVICT_OLLAMA=0 disables it globally.
+try:
+    from ollama_evict import evict_if_needed
+except Exception as _evict_import_exc:  # pragma: no cover - box-only path
+    print("ollama eviction hook unavailable: %r" % (_evict_import_exc,),
+          flush=True)
+    evict_if_needed = None
+EVICT_OLLAMA_ENABLED = os.environ.get("NOVA_EVICT_OLLAMA", "1") != "0"
 
 
 # --------------------------------------------------------------------------
@@ -242,6 +260,8 @@ class Handler(BaseHTTPRequestHandler):
                 "alias": MODEL_ALIAS,
                 "vram_mode": STATE["vram_mode"],
                 "busy": STATE["busy"],
+                "ollama_evict": bool(EVICT_OLLAMA_ENABLED
+                                     and evict_if_needed is not None),
             })
         if path == "/v1/models":
             return self._send_json(200, {
@@ -293,6 +313,15 @@ class Handler(BaseHTTPRequestHandler):
             GEN_LOCK.release()
 
     def _run(self, path, req, prompt):
+        # Claim the GPU from Ollama first (busy-waits an in-flight ST
+        # reply, fail-open: any hook problem still lets us generate).
+        if (EVICT_OLLAMA_ENABLED and evict_if_needed is not None
+                and req.get("evict_ollama", True)):
+            try:
+                evict_if_needed()
+            except Exception as exc:
+                sys.stdout.write("[evict] hook error: %r\n" % (exc,))
+                sys.stdout.flush()
         eng = STATE["engine"]
         width = int(req.get("width", 2048))
         height = int(req.get("height", 2048))
