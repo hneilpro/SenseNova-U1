@@ -192,10 +192,10 @@ def add_offload_args(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_VRAM_MODE,
         help=(
             "Single-GPU layer-offload mode. "
-            "'full' = no offload, whole model on GPU, fastest (default). "
+            "'full' = no offload, whole model on GPU, fastest on cards with ample VRAM. "
             "'fast' = async prefetch, then retain generation layers within the GPU memory budget. "
             "'low' = synchronous per-layer CPU<->GPU swap, smallest weight footprint. "
-            "'balanced' = async prefetch, overlaps H2D with compute, faster than 'low'. "
+            "'balanced' = async prefetch, overlaps H2D with compute, faster than 'low' (default). "
             "Mutually exclusive with --device_map (layer offload requires the model on CPU)."
         ),
     )
