@@ -9,7 +9,7 @@ Design:
   examples use (load_model_and_tokenizer + make_offload_ctx), calling
   model.t2i_generate / model.it2i_generate directly - the exact calls
   examples/t2i/inference.py and examples/editing/inference.py make.
-- vram_mode is HARDCODED to "balanced" in this file (HARDCODED_VRAM_MODE):
+- vram_mode is HARDCODED to "fast" in this file (HARDCODED_VRAM_MODE):
   upstream's "full" default pins ~22.5GB and hangs on the 24GB RTX 4090.
   See the constant's comment block before changing it.
 - Binds 127.0.0.1 only. Remote access is via the cloudflared named tunnel
@@ -60,18 +60,27 @@ MAX_BODY_BYTES = 64 * 1024 * 1024  # base64 inputs for edits can be large
 
 # ---------------------------------------------------------------------------
 # HARDCODED FOR THE RTX 4090 (24GB) - DO NOT CHANGE WITHOUT A GPU TEST.
-# vram_mode MUST default to "balanced" (async-prefetch layer offload).
-# Upstream's default is "full" (whole 8B model resident): on this card that
-# pins ~22.5GB VRAM and HUNG two generation runs - it effectively runs
-# forever or crashes. Every proven CLI run on this box passed
-# --vram_mode balanced explicitly. This constant is deliberately independent
-# of the patched sensenova_u1 DEFAULT_VRAM_MODE so an upstream merge can
-# never silently drop the 4090 default. Override per-experiment with the
-# --vram_mode CLI arg only.
-HARDCODED_VRAM_MODE = "balanced"
-# Edit inputs are downscaled to this pixel budget by default - the same
-# --input_max_pixels 1048576 the proven CLI run scripts use on this box.
-HARDCODED_INPUT_MAX_PIXELS = 1048576
+# vram_mode MUST default to "fast" (async prefetch, generation layers
+# kept resident). Changed from "balanced" 2026-10-21 after a same-seed
+# benchmark on this box (2048x2048, 50 steps): fast 76.5s warm vs balanced
+# 86.0s, byte-identical output. Fast pins ~21.4GB VRAM while generating
+# and its first run in a session is slow (~147s) while layers are pinned.
+# Upstream's default is "full" (whole 8B model resident): on this card
+# that pins ~22.5GB VRAM and HUNG two generation runs - it effectively
+# runs forever or crashes. "balanced" remains the proven fallback. This
+# constant is deliberately independent of the patched sensenova_u1
+# DEFAULT_VRAM_MODE so an upstream merge can never silently drop the
+# 4090 default. Override per-experiment with the --vram_mode CLI arg only.
+HARDCODED_VRAM_MODE = "fast"
+# Edit inputs are downscaled to this pixel budget by default:
+# 2048 * 2048 = 4194304. This is upstream's editing default
+# (DEFAULT_INPUT_MAX_PIXELS = 2048 * 2048 in
+# examples/editing/inference.py) and matches upstream's best-quality
+# guidance to pre-resize inputs to ~2048x2048, original aspect ratio
+# preserved, before inference. Changed 2026-10-22 at the owner's
+# instruction; the previous local default was 1048576 (1024x1024),
+# taken from local CLI run scripts, and is superseded.
+HARDCODED_INPUT_MAX_PIXELS = 4194304
 
 STATE = {
     "model_path": None,
@@ -195,8 +204,9 @@ def tensor_to_pil(batch):
 def resize_to_budget(img, max_pixels: int):
     """Downscale (never upscale) so w*h <= max_pixels, dims multiple of 16.
 
-    Approximation of the editing CLI's smart_resize budget step, which
-    Segi's run scripts drive with --input_max_pixels 1048576.
+    Approximation of the editing CLI's smart_resize budget step.
+    The serving default budget is --input_max_pixels 4194304
+    (2048x2048); see HARDCODED_INPUT_MAX_PIXELS above.
     """
     import math
 
@@ -390,7 +400,7 @@ def main():
     ap.add_argument("--port", type=int, default=8001)
     ap.add_argument("--model_path", default="sensenova/SenseNova-U1.5-8B-MoT")
     ap.add_argument("--vram_mode", default=HARDCODED_VRAM_MODE,
-                    help="default: 'balanced' - HARDCODED for the 24GB "
+                    help="default: 'fast' - HARDCODED for the 24GB "
                          "RTX 4090 (see HARDCODED_VRAM_MODE). Upstream's "
                          "'full' hangs/crashes on this card.")
     ap.add_argument("--token_file", default="~/.nova-api/token.txt")
@@ -400,7 +410,7 @@ def main():
 
     if args.vram_mode == "full":
         print("WARNING: --vram_mode full on the 24GB RTX 4090 pins ~22.5GB "
-              "and has hung generation runs before. 'balanced' is the "
+              "and has hung generation runs before. 'fast' is the "
               "hardcoded default for a reason.", flush=True)
 
     STATE["model_path"] = args.model_path

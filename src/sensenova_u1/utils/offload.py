@@ -33,8 +33,10 @@ VRAM_MODE_OPTIONS: tuple[str, ...] = ("full", "fast", "balanced", "low")
 # LOCAL PATCH (Oct 14 2026): default was "full" (whole 8B model resident).
 # On the 24GB RTX 4090 that pins ~22.5GB VRAM and hung two runs
 # (log frozen after weights, no output). "balanced" offloads and works.
+# UPDATED Oct 21 2026: default is now "fast" (benchmarked fastest warm
+# on the 4090 with byte-identical output; see serving/nova_api.py).
 # Explicit --vram_mode still overrides this. Re-apply after `git pull`.
-DEFAULT_VRAM_MODE: str = "balanced"
+DEFAULT_VRAM_MODE: str = "fast"
 _VRAM_MODE_TO_PREFETCH: dict[str, int] = {
     "full": 0,
     "fast": 2,

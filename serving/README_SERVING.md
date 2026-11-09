@@ -7,7 +7,7 @@ Custom-branch (`custom/nova-serving`) addition; nothing here is upstream.
 `nova_api.py` is a thin, stdlib-only HTTP wrapper around the same local
 inference the CLI examples run. It loads
 `sensenova/SenseNova-U1.5-8B-MoT` once, resident, with the locally patched
-default VRAM mode (`balanced` layer offload — see
+default VRAM mode (`fast` layer offload — see
 `src/sensenova_u1/utils/offload.py`), and calls `t2i_generate` /
 `it2i_generate` through `load_model_and_tokenizer` + `make_offload_ctx`,
 exactly like `examples/t2i/inference.py` and `examples/editing/inference.py`.
@@ -27,26 +27,38 @@ Note: `examples/serving/client.py` targets the LightLLM deployment and is
 
 ## The 4090 flag — hardcoded, do not remove
 
-Generation on this box requires **`--vram_mode balanced`**
-(async-prefetch layer offload). Upstream's default, `full`, keeps the whole
-8B model resident: on the 24GB RTX 4090 that pins ~22.5GB VRAM and hung two
-runs — it takes forever or crashes. Every proven CLI run here passed
-`--vram_mode balanced` explicitly.
+Generation on this box requires **`--vram_mode fast`**
+(async-prefetch layer offload, generation layers kept resident).
+Upstream's default, `full`, keeps the whole 8B model resident: on the
+24GB RTX 4090 that pins ~22.5GB VRAM and hung two runs - it takes
+forever or crashes. `balanced` was the original proven mode; on
+2026-10-21 a same-seed benchmark (2048x2048, 50 steps) showed fast at
+76.5s warm vs balanced 86.0s with byte-identical output, so fast is
+now the default. Fast pins ~21.4GB VRAM while generating, and its
+first run in a session is slow (~147s) while it pins the generation
+layers. `--vram_mode balanced` remains the fallback.
 
 So it is set in three places, on purpose:
 
-1. `nova_api.py`: `HARDCODED_VRAM_MODE = "balanced"` is the argparse
+1. `nova_api.py`: `HARDCODED_VRAM_MODE = "fast"` is the argparse
    default — independent of the upstream
    `sensenova_u1.utils.DEFAULT_VRAM_MODE` patch, so a merge can't lose it.
-2. `start_nova_api.sh` passes `--vram_mode balanced` explicitly
+2. `start_nova_api.sh` passes `--vram_mode fast` explicitly
    (later args can still override it deliberately; the server also warns
    loudly if started with `full`).
 3. `src/sensenova_u1/utils/offload.py` carries the same default for the
    CLI examples (local patch commit on this branch).
 
 Second proven default, also hardcoded in `nova_api.py`:
-edit inputs downscale to `input_max_pixels = 1048576`, matching the CLI
-run scripts.
+edit inputs downscale to `input_max_pixels = 4194304` (2048x2048,
+aspect ratio preserved, never upscaled). This is upstream's editing
+default (`DEFAULT_INPUT_MAX_PIXELS = 2048 * 2048` in
+`examples/editing/inference.py`) and matches upstream's best-quality
+guidance: pre-resize inputs to ~2048x2048 before inference for best
+quality. Changed 2026-10-22 at the owner's instruction; the previous
+local default was `1048576` (1024x1024), taken from local CLI run
+scripts, and is superseded. Per-request override remains available
+via `input_max_pixels` in the edit request body.
 
 ## Ollama eviction — Nova claims the GPU per generation
 
@@ -98,7 +110,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/jso
   -d '{"prompt": "A cozy coffee shop storefront", "seed": 42}'
 
 # image edit: images are base64 PNG/JPEG strings, downscaled to
-# input_max_pixels (default 1048576, same as the CLI run scripts)
+# input_max_pixels (default 4194304 = 2048x2048, upstream editing default)
 curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   http://127.0.0.1:8001/v1/images/edits \
   -d '{"prompt": "...", "images": ["<base64>", "..."], "width": 1536, "height": 2720, "seed": 401}'
@@ -138,7 +150,7 @@ git push origin main                # keep the fork's main in sync
   --output /tmp/main-smoke.png --vram_mode balanced
 git checkout custom/nova-serving && git merge main
 # watch for conflicts in src/sensenova_u1/utils/offload.py
-# (the DEFAULT_VRAM_MODE = "balanced" patch must survive)
+# (the DEFAULT_VRAM_MODE = "fast" patch must survive)
 serving/start_nova_api.sh           # restart, then /health + one generation
 git push origin custom/nova-serving
 ```
