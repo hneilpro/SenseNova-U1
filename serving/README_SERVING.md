@@ -87,6 +87,39 @@ Controls: disable globally with env `NOVA_EVICT_OLLAMA=0`, or per
 request with `"evict_ollama": false` in the generation/edit body.
 `/health` reports whether the hook is active as `ollama_evict`.
 
+## ComfyUI eviction — Nova claims the GPU before it starts
+
+ComfyUI (v0.40.0, `127.0.0.1:8188`) holds VRAM even when idle, and
+Nova in fast mode pins ~21.4GB while generating — a 2026-11-09 test
+failed with only ~7GB free. Unlike Ollama, ComfyUI cannot be evicted
+from inside `nova_api.py`: the model loads at startup, before any
+generation hook could run. So the eviction lives in the launcher
+(`nova_launcher.py`, canonical source `serving/nova_launcher.py`,
+deployed at `~/nova_launcher.py`), in `start_nova()`, via
+`comfy_evict.py`:
+
+1. Checks ComfyUI `/queue`. Evicts ONLY if `queue_running` and
+   `queue_pending` are both empty. If a job is running or queued,
+   Nova is NOT started at all — the caller gets `503 comfyui_busy`
+   and retries later. Nothing is stopped, no waiting.
+2. If idle, stops ComfyUI by exact PID (SIGTERM, SIGKILL fallback
+   after 30s; `/proc` scan, never pattern-kill) and verifies `:8188`
+   is down and VRAM freed before starting Nova.
+3. Restarts ComfyUI (same launch command) when Nova stops, and also
+   if Nova fails to start after an eviction — ComfyUI is never left
+   down by a failed start. A state file `~/.nova-comfy-evict.json`
+   lets a fresh launcher recover ComfyUI if a previous launcher died
+   while it was down.
+
+`nova_api.py` main() calls the same module as a backstop for the
+direct `./start_nova_api.sh` path and refuses to start (exit 3) if
+ComfyUI is busy or the eviction fails.
+
+Controls: disable globally with env `NOVA_EVICT_COMFYUI=0`, or per
+request with `"evict_comfyui": false` in the generation/edit body
+(opt-out still refuses to start into a busy ComfyUI job).
+`/health` on Nova reports the hook as `comfy_evict`.
+
 ## Run
 
 ```bash

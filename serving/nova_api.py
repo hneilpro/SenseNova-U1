@@ -22,6 +22,16 @@ Design:
   automatically on the next ST message. An in-flight ST reply is waited
   out (60s cap), never evicted mid-generation. Disable globally with
   NOVA_EVICT_OLLAMA=0, or per request with {"evict_ollama": false}.
+- ComfyUI eviction (comfy_evict.py) is owned by the launcher
+  (nova_launcher.py), which runs it BEFORE starting this process:
+  the model loads here at startup, so a per-generation hook would
+  be too late. As a backstop for the direct ./start_nova_api.sh
+  path, main() below also calls it before loading the model and
+  refuses to start (exit 3) if ComfyUI is busy or the eviction
+  fails. The launcher restarts ComfyUI when Nova stops; the
+  direct path restarts it in main()'s finally block (SIGTERM
+  bypasses it - the ~/.nova-comfy-evict.json state file lets a
+  fresh launcher recover it). Disable with NOVA_EVICT_COMFYUI=0.
 
 Endpoints:
   GET  /health                  -> {status, model, vram_mode, busy}
@@ -102,6 +112,18 @@ except Exception as _evict_import_exc:  # pragma: no cover - box-only path
           flush=True)
     evict_if_needed = None
 EVICT_OLLAMA_ENABLED = os.environ.get("NOVA_EVICT_OLLAMA", "1") != "0"
+
+# ComfyUI eviction hook (see comfy_evict.py). Same optional-import
+# pattern: a missing/broken hook can never take the API down. The
+# launcher is the primary caller; main() below uses it as a backstop
+# for the direct start path. NOVA_EVICT_COMFYUI=0 disables it globally.
+try:
+    import comfy_evict
+except Exception as _comfy_import_exc:  # pragma: no cover - box-only path
+    print("comfyui eviction hook unavailable: %r" % (_comfy_import_exc,),
+          flush=True)
+    comfy_evict = None
+EVICT_COMFYUI_ENABLED = os.environ.get("NOVA_EVICT_COMFYUI", "1") != "0"
 
 
 # --------------------------------------------------------------------------
@@ -272,6 +294,8 @@ class Handler(BaseHTTPRequestHandler):
                 "busy": STATE["busy"],
                 "ollama_evict": bool(EVICT_OLLAMA_ENABLED
                                      and evict_if_needed is not None),
+                "comfy_evict": bool(EVICT_COMFYUI_ENABLED
+                                    and comfy_evict is not None),
             })
         if path == "/v1/models":
             return self._send_json(200, {
@@ -418,12 +442,37 @@ def main():
     STATE["outputs_dir"] = args.outputs_dir
     STATE["token"] = load_or_create_token(args.token_file)
 
+    # ComfyUI backstop (launcher is the primary caller and normally
+    # already evicted; here queue_status() then returns None and this
+    # is a no-op). Refuse to start into a busy ComfyUI job, or if the
+    # eviction itself fails: the model load would fight it for VRAM.
+    comfy_status = None
+    if EVICT_COMFYUI_ENABLED and comfy_evict is not None:
+        comfy_status = comfy_evict.evict_if_idle()
+        if comfy_status == comfy_evict.BUSY:
+            print("comfyui is running a job; refusing to start Nova "
+                  "(comfyui_busy).", flush=True)
+            sys.exit(3)
+        if comfy_status == comfy_evict.ERROR:
+            print("comfyui eviction failed; refusing to start Nova.",
+                  flush=True)
+            sys.exit(3)
+
     print("loading %s (vram_mode=%s) ..." % (args.model_path, STATE["vram_mode"]),
           flush=True)
     STATE["engine"] = NovaEngine(args.model_path, STATE["vram_mode"])
     print("model loaded; listening on http://%s:%d" % (args.host, args.port),
           flush=True)
-    ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
+    try:
+        ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Direct-start path only: the launcher restarts ComfyUI itself
+        # in stop_nova(). SIGTERM bypasses this; the state file lets a
+        # fresh launcher recover ComfyUI in that case.
+        if comfy_evict is not None and comfy_status == comfy_evict.EVICTED:
+            comfy_evict.restart_comfy()
 
 
 if __name__ == "__main__":
